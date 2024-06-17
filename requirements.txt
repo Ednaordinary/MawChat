@@ -1,0 +1,13 @@
+transformers
+accelerate
+flash_attn
+phonemizer
+nltk
+torchaudio
+librosa
+sounddevice
+munch
+einops_ext
+matplotlib
+sounddevice
+git+https://github.com/resemble-ai/monotonic_align.git
