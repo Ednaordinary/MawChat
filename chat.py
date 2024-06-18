@@ -2,10 +2,13 @@ import time
 import torch
 import gc
 from transformers import AutoModelForCausalLM, TextIteratorStreamer, AutoTokenizer
+import whisper
+import speech_recognition as sr
 import threading
 import random
 import numpy as np
 import nltk
+from queue import Queue
 from munch import Munch
 from torch import nn
 import torch.nn.functional as F
@@ -19,6 +22,7 @@ from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSche
 from nltk.tokenize import word_tokenize
 import phonemizer
 import sounddevice as sd
+import datetime
 
 past_chat = []
 current_chat = None
@@ -34,12 +38,19 @@ def text_streamer(streamer):
     global audio_text_list
     sentence_cache = ""
     for word in streamer:
-        #TODO: add styletts when a period is printed here
         print(word, flush=True, end='')
         if "." in word:
             sentence_cache = sentence_cache + word.split(".")[0]
             audio_text_list.append(sentence_cache)
             sentence_cache = word.split(".")[1]
+        elif "!" in word:
+            sentence_cache = sentence_cache + word.split("!")[0]
+            audio_text_list.append(sentence_cache)
+            sentence_cache = word.split("!")[1]
+        elif "?" in word:
+            sentence_cache = sentence_cache + word.split("?")[0]
+            audio_text_list.append(sentence_cache)
+            sentence_cache = word.split("?")[1]
         else:
             sentence_cache = sentence_cache + word
     print("\n")
@@ -88,7 +99,7 @@ def model_runner():
                 input_ids = torch.cat((init_prompt, input_ids), 1).to("cuda")
                 output_streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
                 stream_thread = threading.Thread(target=text_streamer, args=[output_streamer])
-                model_kwargs = dict(input_ids=input_ids, max_new_tokens=768, use_cache=True,  do_sample=True, pad_token_id=tokenizer.eos_token_id) #max_matching_ngram_size=2, prompt_lookup_num_tokens=15,
+                model_kwargs = dict(input_ids=input_ids, max_new_tokens=768, use_cache=True,  do_sample=True, pad_token_id=tokenizer.eos_token_id) #, max_matching_ngram_size=2, prompt_lookup_num_tokens=15)
                 #TODO: Add prompt_lookup_num_tokens once the eot_id pr is merged
                 stop_token = tokenizer.encode("<|eot_id|>")
                 stream_thread.start()
@@ -272,13 +283,15 @@ def speaker_runner():
 
         return out.squeeze().cpu().numpy(), s_pred
     global audio_text_list
+    global model_loaded
+    model_loaded = 1 # Don't load until after StyleTTS2, otherwise we run into errors.
     while True:
         while audio_text_list == []:
             time.sleep(0.01)
         start = time.time()
         noise = torch.randn(1,1,256).to(device)
-        wav = inference(audio_text_list[0], noise, diffusion_steps=5, embedding_scale=1)
-        print("(StyleTTS2) Real time factor:", round((len(wav) / 24000) / (time.time() - start), 2))
+        wav = inference(audio_text_list[0], noise, diffusion_steps=7, embedding_scale=1)
+        #print("(StyleTTS2) Real time factor:", round((len(wav) / 24000) / (time.time() - start), 2))
         audio_text_list.pop(0)
         audio_play_list.append(wav)
 
@@ -301,12 +314,66 @@ def text_input():
         while current_chat:
             time.sleep(0.01)
 
+def audio_input():
+    global current_chat
+    pt = None
+    dq = Queue()
+    recognizer = sr.Recognizer()
+    recognizer.energy_threshold = 1000
+    recognizer.dynamic_energy_threshold = False
+    mic_name = "default"
+    for index, name in enumerate(sr.Microphone.list_microphone_names()):
+        if mic_name in name:
+            source = sr.Microphone(sample_rate=16000, device_index=index)
+    if not source:
+        print("Failed to find a mic!")
+    else:
+        with torch.no_grad():
+            model = whisper.load_model("small.en", device="cuda")
+            rt = 1.0
+            pto = 1.0
+            transcript = ['']
+            with source:
+                recognizer.adjust_for_ambient_noise(source)
+            def record_callback(_, audio:sr.AudioData) -> None:
+                data = audio.get_raw_data()
+                dq.put(data)
+            recognizer.listen_in_background(source, record_callback, phrase_time_limit=rt)
+            while True:
+                now = datetime.datetime.now(datetime.UTC)
+                if not dq.empty():
+                    phrase_complete = False
+                    if pt and now - pt > datetime.timedelta(seconds=pto):
+                        phrase_complete = True
+                    pt = now
+                    audio_data = b''.join(dq.queue)
+                    dq.queue.clear()
+                    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    result = model.transcribe(audio_np, fp16=True)
+                    text = result['text'].strip()
+                    if phrase_complete:
+                        transcript.append(text)
+                    else:
+                        transcript[-1] = text
+                    print(text, flush=True, end='')
+                    if "." in transcript[-1] or "?" in transcript[-1] or "!" in transcript[-1] or "-" in transcript[-1]:
+                        print("\n")
+                        current_chat = ''.join(transcript)
+                        transcript = ['']
+                        while current_chat == None:
+                            time.sleep(0.01)
+                else:
+                    time.sleep(0.01)
+
 llama_thread = threading.Thread(target=model_runner)
-text_thread = threading.Thread(target=text_input)
+#text_thread = threading.Thread(target=text_input)
 text_player_thread = threading.Thread(target=text_player)
 speaker_thread = threading.Thread(target=speaker_runner)
 text_player_thread.start()
 speaker_thread.start()
 llama_thread.start()
-text_thread.start()
-text_thread.join()
+#text_thread.start()
+#text_thread.join()
+audio_input_thread = threading.Thread(target=audio_input)
+audio_input_thread.start()
+audio_input_thread.join()
