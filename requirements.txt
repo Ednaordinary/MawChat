@@ -10,4 +10,7 @@ munch
 einops_ext
 matplotlib
 sounddevice
+SpeechRecognition
+pyaudio
 git+https://github.com/resemble-ai/monotonic_align.git
+git+https://github.com/openai/whisper.git
