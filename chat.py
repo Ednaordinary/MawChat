@@ -121,7 +121,7 @@ def model_runner():
                 input_ids = torch.cat((init_prompt, input_ids), 1).to("cuda")
                 output_streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
                 stream_thread = threading.Thread(target=text_streamer, args=[output_streamer])
-                model_kwargs = dict(input_ids=input_ids, max_new_tokens=768, use_cache=True,  do_sample=True, pad_token_id=tokenizer.eos_token_id, max_matching_ngram_size=2, prompt_lookup_num_tokens=15) #, temperature=0.6, top_p=0.9)
+                model_kwargs = dict(input_ids=input_ids, max_new_tokens=768, use_cache=True,  do_sample=True, pad_token_id=tokenizer.eos_token_id) # , max_matching_ngram_size=2, prompt_lookup_num_tokens=15) #, temperature=0.6, top_p=0.9)
                 #TODO: Add prompt_lookup_num_tokens once the eot_id pr is merged
                 stop_token = tokenizer.encode("<|eot_id|>")
                 stream_thread.start()
