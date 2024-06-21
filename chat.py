@@ -23,9 +23,10 @@ from nltk.tokenize import word_tokenize
 import phonemizer
 import sounddevice as sd
 import datetime
+import math
 
-# model_mode = "medium" # important! Medium is faster but may have worse transcriptions
-model_mode = "large" # important! Large has a lot more latency but better transcriptions
+model_mode = "medium" # important! Medium is faster but may have worse transcriptions
+#model_mode = "large" # important! Large has a lot more latency but better transcriptions
 
 past_chat = []
 current_chat = None
@@ -34,6 +35,12 @@ model_loaded = 0 # 0 is unloaded, 1 is a request to load, 2 is loaded, 3 is a re
 audio_text_list = []
 audio_play_list = []
 
+class term_colors:
+    LLAMA = '\033[96m'
+    USER = '\033[94m'
+    INFO = '\033[92m'
+    END = '\033[0m'
+
 def text_streamer(streamer):
     """
     For streaming text while model is generating.
@@ -41,7 +48,7 @@ def text_streamer(streamer):
     global audio_text_list
     sentence_cache = ""
     for word in streamer:
-        print(word, flush=True, end='')
+        print(term_colors.LLAMA + word + term_colors.END, flush=True, end='')
         if "." in word:
             sentence_cache = sentence_cache + word.split(".")[0]
             audio_text_list.append(sentence_cache)
@@ -82,6 +89,8 @@ def model_runner():
             )
             if model_mode == "large":
                 model.to('cpu')
+            else:
+                model.to('cuda')
             tokenizer = AutoTokenizer.from_pretrained(
                     "meta-llama/Meta-Llama-3-8B-Instruct",
                     truncation_side="left",
@@ -112,28 +121,21 @@ def model_runner():
                 input_ids = torch.cat((init_prompt, input_ids), 1).to("cuda")
                 output_streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
                 stream_thread = threading.Thread(target=text_streamer, args=[output_streamer])
-                model_kwargs = dict(input_ids=input_ids, max_new_tokens=768, use_cache=True,  do_sample=False, pad_token_id=tokenizer.eos_token_id) #, max_matching_ngram_size=2, prompt_lookup_num_tokens=15) #, temperature=0.6, top_p=0.9)
+                model_kwargs = dict(input_ids=input_ids, max_new_tokens=768, use_cache=True,  do_sample=True, pad_token_id=tokenizer.eos_token_id, max_matching_ngram_size=2, prompt_lookup_num_tokens=15) #, temperature=0.6, top_p=0.9)
                 #TODO: Add prompt_lookup_num_tokens once the eot_id pr is merged
                 stop_token = tokenizer.encode("<|eot_id|>")
                 stream_thread.start()
-                try:
-                    current_response = model.generate(**model_kwargs, streamer=output_streamer, eos_token_id=stop_token)
-                except:
-                    pass
-                threading.Thread(target=unload_llama, args=[model]).start()
+                current_response = model.generate(**model_kwargs, streamer=output_streamer, eos_token_id=stop_token)
+                gc.collect()
+                torch.cuda.empty_cache()
+                if model_mode == "large":
+                    while audio_text_list != []:
+                        time.sleep(0.01)
+                    model.to('cpu')
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                current_chat = None
 
-def unload_llama(model):
-    #this blocks StyleTTS2 from running if we are transferring models so we need to wait for it
-    global current_chat
-    gc.collect()
-    torch.cuda.empty_cache()
-    if model_mode == "large":
-        while audio_text_list != []:
-            time.sleep(0.01)
-        model.to('cpu')
-        gc.collect()
-        torch.cuda.empty_cache()
-    current_chat = None
 
 def speaker_runner():
     """
@@ -321,10 +323,15 @@ def speaker_runner():
             try:
                 start = time.time()
                 noise = torch.randn(1,1,256).to(device)
-                wav = inference(audio_text_list[0], noise, diffusion_steps=7, embedding_scale=1)
+                if len(audio_text_list[0].split(" ")) == 0:
+                    emotion = 1.0
+                else:
+                    emotion = (2.0 + (math.log(len(audio_text_list[0].split(" "))/100)/2)) * 1.4
+                wav = inference(audio_text_list[0], noise, diffusion_steps=7, embedding_scale=emotion)
                 #print("(StyleTTS2) Real time factor:", round((len(wav) / 24000) / (time.time() - start), 2))
                 audio_play_list.append(wav)
-            except:
+            except Exception as e:
+                print(repr(e))
                 pass
         audio_text_list.pop(0)
 
@@ -365,7 +372,7 @@ def audio_input():
         if mic_name in name:
             source = sr.Microphone(sample_rate=16000, device_index=index)
     if not source:
-        print("Failed to find a mic!")
+        print(term_colors.INFO + "Failed to find a mic!" + term_color.END)
     else:
         with torch.no_grad():
             while model_loaded == 0:
@@ -374,7 +381,7 @@ def audio_input():
                 model = whisper.load_model("large", device='cuda')
             elif model_mode == "medium":
                 model = whisper.load_model("medium.en", device='cuda')
-            print("Model loaded! Start speaking now")
+            print(term_colors.INFO + "Model loaded! Start speaking now" + term_colors.END)
             #model.to('cpu')
             rt = 1.0
             pto = 1.0
@@ -403,7 +410,7 @@ def audio_input():
                         transcript.append(text)
                     else:
                         transcript[-1] = text
-                    print(text, flush=True, end='')
+                    print(term_colors.USER + text + term_colors.END, flush=True, end='')
                     if "." in transcript[-1] or "?" in transcript[-1] or "!" in transcript[-1]:
                         print("\n")
                         if model_mode == "large":
@@ -414,6 +421,7 @@ def audio_input():
                             time.sleep(0.01)
                         if model_mode == "large":
                             model.to('cuda')
+                        print(term_colors.INFO + "(Speak now)\n" + term_colors.END)
                 else:
                     time.sleep(0.01)
 
