@@ -24,10 +24,13 @@ import phonemizer
 import sounddevice as sd
 import datetime
 
+# model_mode = "medium" # important! Medium is faster but may have worse transcriptions
+model_mode = "large" # important! Large has a lot more latency but better transcriptions
+
 past_chat = []
 current_chat = None
 current_response = None
-model_loaded = 0 # 0 is unloaded, 1 is a request to load, 2 is loaded, 3 is a request to unload
+model_loaded = 0 # 0 is unloaded, 1 is a request to load, 2 is loaded, 3 is a request to unload, 4 is to move to cpu, 5 is to move to gpu
 audio_text_list = []
 audio_play_list = []
 
@@ -72,11 +75,13 @@ def model_runner():
         if model_loaded == 1:
             model = AutoModelForCausalLM.from_pretrained(
                 "meta-llama/Meta-Llama-3-8B-Instruct",
-                device_map="auto",
+                #device_map="auto",
                 torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True,
                 attn_implementation="flash_attention_2",
             )
+            if model_mode == "large":
+                model.to('cpu')
             tokenizer = AutoTokenizer.from_pretrained(
                     "meta-llama/Meta-Llama-3-8B-Instruct",
                     truncation_side="left",
@@ -86,10 +91,18 @@ def model_runner():
             model, tokenizer = None
             gc.collect()
             torch.cuda.empty_cache()
+        #if model_loaded == 4:
+        #    model.to('cpu')
+        #    model_loaded = 2
+        #if model_loaded == 5:
+        #    model.to('cuda')
+        #    model_loaded = 2
         if current_chat:
             if model_loaded != 2:
                 model_loaded = 1
             else:
+                if model.device.type == 'cpu':
+                    model.to('cuda')
                 sys_prompt= [ {"role": "system", "content": "You are Maw, an intelligence model that answers questions to the best of my knowledge. You may also be referred to as Mode Assistance. You were developed by Mode LLC, a company founded by Edna. Respond briefly, as your words are spoken out loud."}]
                 this_chat = {"role": "user", "content": str(current_chat)}
                 past_chat.append(this_chat)
@@ -99,12 +112,28 @@ def model_runner():
                 input_ids = torch.cat((init_prompt, input_ids), 1).to("cuda")
                 output_streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
                 stream_thread = threading.Thread(target=text_streamer, args=[output_streamer])
-                model_kwargs = dict(input_ids=input_ids, max_new_tokens=768, use_cache=True,  do_sample=True, pad_token_id=tokenizer.eos_token_id) #, max_matching_ngram_size=2, prompt_lookup_num_tokens=15)
+                model_kwargs = dict(input_ids=input_ids, max_new_tokens=768, use_cache=True,  do_sample=False, pad_token_id=tokenizer.eos_token_id) #, max_matching_ngram_size=2, prompt_lookup_num_tokens=15) #, temperature=0.6, top_p=0.9)
                 #TODO: Add prompt_lookup_num_tokens once the eot_id pr is merged
                 stop_token = tokenizer.encode("<|eot_id|>")
                 stream_thread.start()
-                current_response = model.generate(**model_kwargs, streamer=output_streamer, eos_token_id=stop_token)
-                current_chat = None
+                try:
+                    current_response = model.generate(**model_kwargs, streamer=output_streamer, eos_token_id=stop_token)
+                except:
+                    pass
+                threading.Thread(target=unload_llama, args=[model]).start()
+
+def unload_llama(model):
+    #this blocks StyleTTS2 from running if we are transferring models so we need to wait for it
+    global current_chat
+    gc.collect()
+    torch.cuda.empty_cache()
+    if model_mode == "large":
+        while audio_text_list != []:
+            time.sleep(0.01)
+        model.to('cpu')
+        gc.collect()
+        torch.cuda.empty_cache()
+    current_chat = None
 
 def speaker_runner():
     """
@@ -284,16 +313,20 @@ def speaker_runner():
         return out.squeeze().cpu().numpy(), s_pred
     global audio_text_list
     global model_loaded
-    model_loaded = 1 # Don't load until after StyleTTS2, otherwise we run into errors.
+    model_loaded = 1 # Don't load llama until after StyleTTS2, otherwise we run into errors.
     while True:
         while audio_text_list == []:
             time.sleep(0.01)
-        start = time.time()
-        noise = torch.randn(1,1,256).to(device)
-        wav = inference(audio_text_list[0], noise, diffusion_steps=7, embedding_scale=1)
-        #print("(StyleTTS2) Real time factor:", round((len(wav) / 24000) / (time.time() - start), 2))
+        if audio_text_list[0] != "":
+            try:
+                start = time.time()
+                noise = torch.randn(1,1,256).to(device)
+                wav = inference(audio_text_list[0], noise, diffusion_steps=7, embedding_scale=1)
+                #print("(StyleTTS2) Real time factor:", round((len(wav) / 24000) / (time.time() - start), 2))
+                audio_play_list.append(wav)
+            except:
+                pass
         audio_text_list.pop(0)
-        audio_play_list.append(wav)
 
 def text_player():
     """
@@ -314,8 +347,14 @@ def text_input():
         while current_chat:
             time.sleep(0.01)
 
+def load_to(model, device):
+    model.to(device)
+    gc.collect()
+    torch.cuda.empty_cache()
+
 def audio_input():
     global current_chat
+    global model_loaded
     pt = None
     dq = Queue()
     recognizer = sr.Recognizer()
@@ -329,7 +368,14 @@ def audio_input():
         print("Failed to find a mic!")
     else:
         with torch.no_grad():
-            model = whisper.load_model("small.en", device="cuda")
+            while model_loaded == 0:
+                time.sleep(0.01)
+            if model_mode == "large":
+                model = whisper.load_model("large", device='cuda')
+            elif model_mode == "medium":
+                model = whisper.load_model("medium.en", device='cuda')
+            print("Model loaded! Start speaking now")
+            #model.to('cpu')
             rt = 1.0
             pto = 1.0
             transcript = ['']
@@ -349,19 +395,25 @@ def audio_input():
                     audio_data = b''.join(dq.queue)
                     dq.queue.clear()
                     audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    #model_loaded = 4
                     result = model.transcribe(audio_np, fp16=True)
+                    #model_loaded = 5
                     text = result['text'].strip()
                     if phrase_complete:
                         transcript.append(text)
                     else:
                         transcript[-1] = text
                     print(text, flush=True, end='')
-                    if "." in transcript[-1] or "?" in transcript[-1] or "!" in transcript[-1] or "-" in transcript[-1]:
+                    if "." in transcript[-1] or "?" in transcript[-1] or "!" in transcript[-1]:
                         print("\n")
+                        if model_mode == "large":
+                            threading.Thread(target=load_to, args=[model, 'cpu']).start()
                         current_chat = ''.join(transcript)
                         transcript = ['']
-                        while current_chat == None:
+                        while current_chat != None:
                             time.sleep(0.01)
+                        if model_mode == "large":
+                            model.to('cuda')
                 else:
                     time.sleep(0.01)
 
