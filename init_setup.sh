@@ -1,4 +1,4 @@
-echo "This next part will install espeak-ng and git-lfs. If you already have these installed or don't want to run as a super user, use init_setup_no_sudo.sh"
+echo "This next part will install espeak-ng and git-lfs. If you already have these installed and don't want to run as a super user, use init_setup_no_sudo.sh"
 sudo apt install espeak-ng git-lfs
 python3 -m venv venv
 source venv/bin/activate
